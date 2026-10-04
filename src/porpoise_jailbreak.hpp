@@ -7,7 +7,10 @@ namespace porpoise::jailbreak
 {
 /* Whether /data is there and Porpoise can write in /data/porpoise. */
 bool data_reachable();
-/* When it isn't: asks etaHEN / OnionHEN to free this process (a few seconds
- * at most). True when /data is reachable afterwards. */
+/* When it isn't: asks etaHEN / OnionHEN / Lapy JB Daemon to free this
+ * process (a few seconds at most). Retries the file-based request up to
+ * three times to handle the Lapy daemon's getHijacker timing race, and
+ * verifies the actual credential bump after each round. Falls back to the
+ * legacy port-based servers. True when /data is reachable afterwards. */
 bool ensure();
 } // namespace porpoise::jailbreak

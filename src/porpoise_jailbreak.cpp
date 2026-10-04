@@ -10,10 +10,19 @@
  * (ps5/coreorbis/orbis-shims/ProsperoHenJailbreak.cpp and main-boot.cpp in
  * PS5SX2, GPL-3.0-or-later; this is a port of its approach):
  *
- *   1. etaHEN / OnionHEN's request file: {"PID":<pid>} written to
- *      /download0/etahen_jailbreak (atomically, through a .tmp). The HEN
- *      consumes it and frees the process, if the title ID is on its app
- *      jailbreak list.
+ *   1. etaHEN / OnionHEN / Lapy JB Daemon's request file: {"PID":<pid>}
+ *      written to /download0/etahen_jailbreak (atomically, through a .tmp).
+ *      The HEN or daemon consumes it and frees the process. etaHEN/OnionHEN
+ *      need the title ID on their app jailbreak list; Lapy JB Daemon handles
+ *      any app automatically.
+ *
+ *      Lapy JB Daemon note: the daemon's getHijacker call can lose a timing
+ *      race on the first try (the process isn't visible to the kernel proc
+ *      scanner yet). The daemon deletes the request file regardless of
+ *      whether the jailbreak succeeded, so a consumed file does not prove
+ *      success. Porpoise retries the whole request up to three times,
+ *      checking uid and /data access after each round.
+ *
  *   2. Failing that, the legacy command servers on 127.0.0.1 (etaHEN 9028,
  *      the SharpProspero unjail daemon 9069): command 5, jailbreak this PID.
  *
@@ -45,6 +54,10 @@ namespace
 {
 constexpr char kRequest[] = "/download0/etahen_jailbreak";
 constexpr char kStaged[] = "/download0/etahen_jailbreak.tmp";
+/* Maximum attempts for the file-based jailbreak. Lapy JB Daemon can lose a
+ * timing race on the first try (getHijacker fails when the process is too
+ * new); a second or third attempt usually wins. */
+constexpr int kMaxFileAttempts = 3;
 
 void note(const char *fmt, int a = 0, int b = 0, int c = 0)
 {
@@ -53,8 +66,15 @@ void note(const char *fmt, int a = 0, int b = 0, int c = 0)
     ps5::debug::mark(line);
 }
 
-/* The HEN's request file. True when it was consumed (and, ideally, we are root). */
-bool request_file()
+/* Whether the process has been jailbroken (uid 0 = root). This catches the
+ * case where Lapy JB Daemon consumed the request file but getHijacker lost
+ * the race and the actual credential bump never happened. */
+bool is_root() { return geteuid() == 0; }
+
+/* Write the request file and wait for a daemon to pick it up. Returns true
+ * only when something consumed the file (the actual jailbreak may still have
+ * failed on the daemon's side). */
+bool publish_request()
 {
     const int pid = int(getpid());
     unlink(kStaged);
@@ -76,7 +96,7 @@ bool request_file()
         note("jailbreak: request file not published (errno %d)", errno);
         return false;
     }
-    /* Up to 4 s for the HEN to take it, then up to 2 s for it to finish. */
+    /* Up to 4 s for the daemon to take the file. */
     int polls = 0;
     while (access(kRequest, F_OK) == 0 && polls < 240)
     {
@@ -86,18 +106,75 @@ bool request_file()
     if (access(kRequest, F_OK) == 0)
     {
         unlink(kRequest);
-        note("jailbreak: the HEN didn't take the request (is PPSA99764 on its app jailbreak list?)");
+        note("jailbreak: no daemon took the request");
         return false;
     }
-    /* Up to 2 s for /data to open up (not every HEN makes the app root). */
-    int grace = 0;
-    while (!data_reachable() && grace < 120)
-    {
-        sceKernelUsleep(16667);
-        ++grace;
-    }
-    note("jailbreak: request taken after %d polls; uid now %d", polls, int(geteuid()));
+    note("jailbreak: request taken after %d polls", polls);
     return true;
+}
+
+/* Full file-based jailbreak cycle with retries. Handles the Lapy JB Daemon
+ * timing race: the daemon always deletes the file even when getHijacker
+ * fails, so "file consumed" does not mean "jailbreak done." We verify with
+ * is_root() and data_reachable() after each attempt and retry if needed. */
+bool request_file()
+{
+    for (int attempt = 1; attempt <= kMaxFileAttempts; ++attempt)
+    {
+        note("jailbreak: file attempt %d/%d", attempt, kMaxFileAttempts);
+
+        /* Small delay before retries so the daemon's proc scanner can catch
+         * up. The first attempt goes immediately. */
+        if (attempt > 1)
+            sceKernelUsleep(500000); /* 500 ms between retries */
+
+        if (!publish_request())
+        {
+            /* No daemon consumed the file. On the first attempt this might
+             * mean etaHEN isn't loaded; on retries it means the daemon went
+             * away. Either way, fall through to the port-based path. */
+            if (attempt == 1)
+                note("jailbreak: file not consumed (is PPSA99764 on the HEN's "
+                     "list, or is Lapy JB Daemon running?)");
+            break;
+        }
+
+        /* The file was consumed. Give the daemon up to 2 s to finish the
+         * credential bump and sandbox escape. */
+        int grace = 0;
+        while (!is_root() && grace < 120)
+        {
+            sceKernelUsleep(16667);
+            ++grace;
+        }
+
+        if (is_root())
+        {
+            /* Credential bump confirmed. Wait a little more for the sandbox
+             * escape (fd_rdir/fd_jdir = rootvnode) to take effect. */
+            grace = 0;
+            while (!data_reachable() && grace < 120)
+            {
+                sceKernelUsleep(16667);
+                ++grace;
+            }
+            note("jailbreak: confirmed root after attempt %d; uid=%d", attempt, int(geteuid()));
+            return true;
+        }
+
+        /* The daemon consumed the file but the jailbreak didn't stick
+         * (Lapy JB Daemon timing race). Try again. */
+        note("jailbreak: attempt %d consumed but uid still %d; retrying", attempt, int(geteuid()));
+    }
+
+    /* Final fallback: even without uid 0, check whether /data is reachable.
+     * Some HEN configurations grant filesystem access without changing uid. */
+    if (data_reachable())
+    {
+        note("jailbreak: uid is %d but /data is reachable", int(geteuid()));
+        return true;
+    }
+    return false;
 }
 
 /* The legacy command servers: magic, command 5 (jailbreak), the PID. */
@@ -175,11 +252,20 @@ bool ensure()
 {
     if (data_reachable())
         return true;
-    note("jailbreak: /data isn't reachable (uid %d); asking the HEN", int(geteuid()));
+    note("jailbreak: /data isn't reachable (uid %d); asking the HEN / daemon", int(geteuid()));
     if (!request_file())
         request_port();
+    /* One more check after everything has been tried. */
+    if (!data_reachable())
+    {
+        /* Last resort: a short sleep then recheck. Some daemons finish the
+         * sandbox escape asynchronously after the credential bump. */
+        sceKernelUsleep(500000);
+    }
     const bool ok = data_reachable();
-    note(ok ? "jailbreak: /data is reachable now" : "jailbreak: still sandboxed; using the app's own folder");
+    note(ok ? "jailbreak: /data is reachable now (uid %d)"
+            : "jailbreak: still sandboxed (uid %d); using the app's own folder",
+         int(geteuid()));
     return ok;
 }
 } // namespace porpoise::jailbreak
