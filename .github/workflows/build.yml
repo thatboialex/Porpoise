@@ -1,0 +1,104 @@
+name: Build Porpoise
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang-18 lld-18 llvm-18 \
+            cmake make ninja-build meson \
+            python3 python3-pil python3-mako python3-yaml python3-ply \
+            git wget curl unzip zip rsync \
+            libelf-dev libexpat1-dev bison flex byacc \
+            zlib1g-dev pkg-config
+
+      # ---------- checkouts (sibling layout) ----------
+      - name: Checkout Porpoise
+        uses: actions/checkout@v4
+        with:
+          path: Porpoise
+
+      - name: Checkout PS5_PayloadSDK
+        uses: actions/checkout@v4
+        with:
+          repository: mihawk-99/PS5_PayloadSDK
+          path: PS5_PayloadSDK
+          fetch-depth: 0          # setup script needs full history for the pinned revision
+
+      - name: Checkout PS5_Vulkan
+        uses: actions/checkout@v4
+        with:
+          repository: mihawk-99/PS5_Vulkan
+          path: PS5_Vulkan
+          fetch-depth: 0
+
+      - name: Checkout PS5_Mesa
+        uses: actions/checkout@v4
+        with:
+          repository: mihawk-99/PS5_Mesa
+          path: PS5_Mesa
+          fetch-depth: 0
+
+      # ---------- SDK ----------
+      - name: Cache SDK and RADV
+        uses: actions/cache@v4
+        with:
+          path: |
+            Porpoise/.deps/native/ps5-payload-sdk
+            Porpoise/.deps/native/zlib
+            PS5_Vulkan/.deps/native
+          key: sdk-radv-${{ hashFiles('Porpoise/tools/setup-native-dependencies.sh', 'PS5_Vulkan/tools/build-radv.sh') }}
+          restore-keys: sdk-radv-
+
+      - name: Bootstrap SDK
+        working-directory: Porpoise
+        run: bash tools/setup-native-dependencies.sh
+
+      # ---------- RADV ----------
+      - name: Build RADV (release)
+        working-directory: PS5_Vulkan
+        run: |
+          # The RADV build script looks for the SDK via PS5_Vulkan's own setup;
+          # point it at Porpoise's already-built copy.
+          bash tools/setup-native-dependencies.sh --skip-sdk 2>&1 || true
+          # Symlink the SDK Porpoise built into PS5_Vulkan's expected location
+          mkdir -p .deps/native
+          ln -sfn "$GITHUB_WORKSPACE/Porpoise/.deps/native/ps5-payload-sdk" \
+                  .deps/native/ps5-payload-sdk
+          bash tools/build-radv.sh release
+
+      # ---------- Dolphin core ----------
+      - name: Cache Dolphin source
+        uses: actions/cache@v4
+        with:
+          path: Porpoise/.deps/dolphin-src
+          key: dolphin-${{ hashFiles('Porpoise/tools/build-dolphin.sh') }}
+          restore-keys: dolphin-
+
+      # ---------- full build ----------
+      - name: Build Porpoise
+        working-directory: Porpoise
+        env:
+          PS5_VULKAN_DIR: ${{ github.workspace }}/PS5_Vulkan
+          PS5_PAYLOAD_SDK_FORK: ${{ github.workspace }}/PS5_PayloadSDK
+          PS5_MESA_FORK: ${{ github.workspace }}/PS5_Mesa
+          JOBS: 4
+        run: make porpoise
+
+      # ---------- artifact ----------
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Porpoise-PPSA99764
+          path: Porpoise/dist/Porpoise-PPSA99764.zip
+          if-no-files-found: error
