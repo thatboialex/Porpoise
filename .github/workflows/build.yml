@@ -19,11 +19,17 @@ jobs:
             llvm-18-dev libclang-18-dev libclc-18-dev \
             spirv-tools spirv-headers glslang-tools glslang-dev \
             cmake make ninja-build meson \
-            python3 python3-pil python3-mako python3-yaml python3-ply python3-packaging \
+            python3 python3-pip python3-pil python3-mako python3-yaml python3-ply python3-packaging \
             git wget curl unzip zip rsync \
             libelf-dev libexpat1-dev libdrm-dev libwayland-dev wayland-protocols \
             bison flex byacc \
             zlib1g-dev pkg-config
+
+      - name: Install modern Meson
+        run: |
+          python3 -m pip install --user --break-system-packages 'meson>=1.4,<2'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/meson" --version
 
       # ---------- checkouts (sibling layout) ----------
       - name: Checkout Porpoise
